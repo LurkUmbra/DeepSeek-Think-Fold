@@ -1,14 +1,15 @@
 // ==UserScript==
 // @name         DeepSeek Think Auto-Collapse (Collapse After Thinking + Copy Button)
 // @namespace    https://github.com/hza2002/deepseek-collapse-think
-// @version      2.0
-// @description  Smoothly collapse DeepSeek's Think block after reasoning completes, and add a copy button next to the toggle icon.
+// @version      2.1
+// @description  Smoothly collapse DeepSeek's Think block after reasoning completes, and add a copy button right next to the toggle icon.
 // @license      MIT
 // @match        https://chat.deepseek.com/*
 // @icon         https://chat.deepseek.com/favicon.svg
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
+// @run-at       document-idle
 // ==/UserScript==
 
 (function() {
@@ -94,10 +95,10 @@
                 display: inline-flex;
                 align-items: center;
                 justify-content: center;
-                width: 22px;
-                height: 22px;
+                width: 18px;
+                height: 18px;
                 padding: 0;
-                margin-left: 6px;
+                margin-left: 4px;
                 border: none;
                 border-radius: 4px;
                 background: transparent;
@@ -108,6 +109,7 @@
                 flex-shrink: 0;
                 vertical-align: middle;
                 line-height: 1;
+                user-select: none;
             }
             .${COPY_BTN_CLASS}:hover {
                 opacity: 1;
@@ -118,8 +120,8 @@
                 color: #22c55e;
             }
             .${COPY_BTN_CLASS} svg {
-                width: 14px;
-                height: 14px;
+                width: 12px;
+                height: 12px;
                 pointer-events: none;
                 display: block;
             }
@@ -150,18 +152,15 @@
 
     // ==================== Copy Button ====================
     function extractThinkText(block) {
-        // Prefer cache first
         if (thinkTextCache.has(block)) {
             const cached = thinkTextCache.get(block);
             if (cached) return cached;
         }
-        // Use thinkContent (textContent works even when hidden)
         const content = block.querySelector('.' + SELECTORS.thinkContent);
         let text = '';
         if (content) {
             text = content.textContent || '';
         } else {
-            // Fallback: clone the block, strip button and header
             const clone = block.cloneNode(true);
             clone.querySelector('.' + COPY_BTN_CLASS)?.remove();
             clone.querySelector('.' + SELECTORS.toggleButton)?.remove();
@@ -182,7 +181,6 @@
             await navigator.clipboard.writeText(text);
             return true;
         } catch (e) {
-            // Fallback: textarea + execCommand
             try {
                 const ta = document.createElement('textarea');
                 ta.value = text;
@@ -200,6 +198,7 @@
     }
 
     function injectCopyButton(block) {
+        // Skip if already injected (either in the block or inside toggleButton)
         if (block.querySelector('.' + COPY_BTN_CLASS)) return;
 
         const toggleButton = block.querySelector('.' + SELECTORS.toggleButton);
@@ -207,14 +206,17 @@
 
         ensureStyle();
 
-        const btn = document.createElement('button');
-        btn.type = 'button';
+        // Use <span role="button"> instead of <button>,
+        // because toggleButton itself may be a <button> and nested <button> is invalid HTML.
+        const btn = document.createElement('span');
         btn.className = COPY_BTN_CLASS;
+        btn.setAttribute('role', 'button');
+        btn.setAttribute('tabindex', '0');
         btn.title = 'Copy thinking process';
         btn.setAttribute('aria-label', 'Copy thinking process');
         btn.innerHTML = COPY_ICON;
 
-        btn.addEventListener('click', async (e) => {
+        const doCopy = async (e) => {
             e.stopPropagation();
             e.preventDefault();
 
@@ -237,30 +239,24 @@
             } else {
                 btn.title = 'Copy failed';
             }
-        });
+        };
 
-        // Prevent drag / selection interference
+        btn.addEventListener('click', doCopy);
+        btn.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' || e.key === ' ') doCopy(e);
+        });
         btn.addEventListener('mousedown', (e) => e.stopPropagation());
 
-        // Insert into toggleButton's parent so it sits to the right of the toggle icon
-        const parent = toggleButton.parentElement;
-        if (parent) {
-            const parentStyle = getComputedStyle(parent);
-            // Make parent flex if it isn't already, so the button vertically aligns
-            if (parentStyle.display !== 'flex' && parentStyle.display !== 'inline-flex') {
-                parent.style.display = 'flex';
-                parent.style.alignItems = 'center';
-            }
-            parent.appendChild(btn);
-        } else {
-            // Fallback: absolute-position at the top-right corner of the block
-            const bs = getComputedStyle(block);
-            if (bs.position === 'static') block.style.position = 'relative';
-            btn.style.position = 'absolute';
-            btn.style.top = '8px';
-            btn.style.right = '8px';
-            block.appendChild(btn);
+        // Make sure toggleButton can host the button inline, next to the arrow icon
+        const tbStyle = getComputedStyle(toggleButton);
+        if (tbStyle.display !== 'flex' && tbStyle.display !== 'inline-flex') {
+            toggleButton.style.display = 'inline-flex';
+            toggleButton.style.alignItems = 'center';
         }
+
+        // Append INSIDE toggleButton, at the very end.
+        // This puts the button right after the arrow icon / label, not far to the right.
+        toggleButton.appendChild(btn);
     }
 
     // ==================== Smooth Collapse ====================
@@ -360,7 +356,6 @@
             clearInterval(state.timerId);
             state.timerId = null;
 
-            // Final cache before collapsing
             cacheThinkText(block);
 
             const scrollContainer = getScrollContainer(block);
@@ -388,7 +383,6 @@
             trackUntilStable(block);
         });
 
-        // Also inject buttons into already-collapsed blocks (e.g. history on reload)
         const collapsedSelector = `.${SELECTORS.thinkBlockContainer}.${SELECTORS.collapsedStateClass}`;
         document.querySelectorAll(collapsedSelector).forEach(block => {
             injectCopyButton(block);
@@ -398,7 +392,6 @@
     // ==================== Listeners ====================
     function setupUserInteractionListener() {
         document.addEventListener('click', (event) => {
-            // Clicking the copy button is not a user expand action
             if (event.target.closest('.' + COPY_BTN_CLASS)) return;
 
             const toggleButton = event.target.closest(`.${SELECTORS.toggleButton}`);
