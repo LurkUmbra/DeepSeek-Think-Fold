@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         DeepSeek Think 自动收起（思考完成后折叠）
+// @name         DeepSeek Think Auto-Collapse (Collapse After Thinking + Copy Button)
 // @namespace    https://github.com/hza2002/deepseek-collapse-think
-// @version      1.0
-// @description  等 DeepSeek 的 Think 思考过程完成后，再平滑折叠，避免流式渲染回弹。
+// @version      2.0
+// @description  Smoothly collapse DeepSeek's Think block after reasoning completes, and add a copy button next to the toggle icon.
 // @license      MIT
 // @match        https://chat.deepseek.com/*
 // @icon         https://chat.deepseek.com/favicon.svg
@@ -14,7 +14,7 @@
 (function() {
     'use strict';
 
-    // ==================== 配置项 ====================
+    // ==================== Configuration ====================
     const DEFAULT_CONFIG = {
         enabled: true,
         debug: false,
@@ -24,9 +24,7 @@
         bottomThreshold: 200,
         collapseDuration: 350,
         smoothCollapse: true,
-        // 【核心】内容稳定多久后认为思考结束（毫秒）
         stableThreshold: 800,
-        // 轮询间隔（毫秒）
         pollInterval: 200
     };
 
@@ -48,6 +46,7 @@
         pollInterval: DEFAULT_CONFIG.pollInterval
     };
 
+    // ==================== Selectors ====================
     const SELECTORS = {
         thinkBlockContainer: '_74c0879',
         collapsedStateClass: 'e47135bc',
@@ -55,11 +54,17 @@
         thinkContent: 'ds-think-content'
     };
 
-    // ==================== 状态 ====================
+    const COPY_BTN_CLASS = 'ds-copy-think-btn';
+    const STYLE_ID = 'ds-copy-think-style';
+    const COPY_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>`;
+    const CHECK_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>`;
+
+    // ==================== State ====================
     let currentUrl = location.href;
     let lastUserInteraction = 0;
     const blockStates = new WeakMap();
     const userExpandedBlocks = new WeakSet();
+    const thinkTextCache = new WeakMap();
 
     function log(...args) {
         if (CONFIG.debug) console.log('[DeepSeek Think]', ...args);
@@ -71,15 +76,58 @@
 
     function registerMenuCommands() {
         if (typeof GM_registerMenuCommand === 'undefined') return;
-        const statusText = CONFIG.enabled ? '✅ 已启用' : '❌ 已禁用';
-        GM_registerMenuCommand(`${statusText} - 点击切换`, () => {
+        const statusText = CONFIG.enabled ? '✅ Enabled' : '❌ Disabled';
+        GM_registerMenuCommand(`${statusText} - Click to toggle`, () => {
             CONFIG.enabled = !CONFIG.enabled;
-            alert(`DeepSeek Think 自动收起: ${CONFIG.enabled ? '已启用' : '已禁用'}\n\n刷新页面后生效`);
+            alert(`DeepSeek Think Auto-Collapse: ${CONFIG.enabled ? 'Enabled' : 'Disabled'}\n\nReload the page to apply.`);
             location.reload();
         });
     }
 
-    // ==================== 滚动工具 ====================
+    // ==================== Style Injection ====================
+    function ensureStyle() {
+        if (document.getElementById(STYLE_ID)) return;
+        const style = document.createElement('style');
+        style.id = STYLE_ID;
+        style.textContent = `
+            .${COPY_BTN_CLASS} {
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                width: 22px;
+                height: 22px;
+                padding: 0;
+                margin-left: 6px;
+                border: none;
+                border-radius: 4px;
+                background: transparent;
+                color: inherit;
+                cursor: pointer;
+                opacity: 0.55;
+                transition: opacity 0.15s, background 0.15s, color 0.15s;
+                flex-shrink: 0;
+                vertical-align: middle;
+                line-height: 1;
+            }
+            .${COPY_BTN_CLASS}:hover {
+                opacity: 1;
+                background: rgba(128,128,128,0.18);
+            }
+            .${COPY_BTN_CLASS}.copied {
+                opacity: 1;
+                color: #22c55e;
+            }
+            .${COPY_BTN_CLASS} svg {
+                width: 14px;
+                height: 14px;
+                pointer-events: none;
+                display: block;
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ==================== Scroll Utilities ====================
     function getScrollContainer(fromEl) {
         let node = fromEl ? fromEl.parentElement : document.body;
         while (node && node !== document.documentElement) {
@@ -100,7 +148,122 @@
         container.scrollTop = container.scrollHeight;
     }
 
-    // ==================== 平滑折叠 ====================
+    // ==================== Copy Button ====================
+    function extractThinkText(block) {
+        // Prefer cache first
+        if (thinkTextCache.has(block)) {
+            const cached = thinkTextCache.get(block);
+            if (cached) return cached;
+        }
+        // Use thinkContent (textContent works even when hidden)
+        const content = block.querySelector('.' + SELECTORS.thinkContent);
+        let text = '';
+        if (content) {
+            text = content.textContent || '';
+        } else {
+            // Fallback: clone the block, strip button and header
+            const clone = block.cloneNode(true);
+            clone.querySelector('.' + COPY_BTN_CLASS)?.remove();
+            clone.querySelector('.' + SELECTORS.toggleButton)?.remove();
+            text = clone.textContent || '';
+        }
+        return text.trim();
+    }
+
+    function cacheThinkText(block) {
+        const content = block.querySelector('.' + SELECTORS.thinkContent);
+        if (!content) return;
+        const text = (content.textContent || '').trim();
+        if (text) thinkTextCache.set(block, text);
+    }
+
+    async function copyToClipboard(text) {
+        try {
+            await navigator.clipboard.writeText(text);
+            return true;
+        } catch (e) {
+            // Fallback: textarea + execCommand
+            try {
+                const ta = document.createElement('textarea');
+                ta.value = text;
+                ta.style.position = 'fixed';
+                ta.style.opacity = '0';
+                document.body.appendChild(ta);
+                ta.select();
+                const ok = document.execCommand('copy');
+                document.body.removeChild(ta);
+                return ok;
+            } catch (err) {
+                return false;
+            }
+        }
+    }
+
+    function injectCopyButton(block) {
+        if (block.querySelector('.' + COPY_BTN_CLASS)) return;
+
+        const toggleButton = block.querySelector('.' + SELECTORS.toggleButton);
+        if (!toggleButton) return;
+
+        ensureStyle();
+
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = COPY_BTN_CLASS;
+        btn.title = 'Copy thinking process';
+        btn.setAttribute('aria-label', 'Copy thinking process');
+        btn.innerHTML = COPY_ICON;
+
+        btn.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            e.preventDefault();
+
+            const text = extractThinkText(block);
+            if (!text) {
+                btn.title = 'Nothing to copy';
+                return;
+            }
+
+            const ok = await copyToClipboard(text);
+            if (ok) {
+                btn.innerHTML = CHECK_ICON;
+                btn.classList.add('copied');
+                btn.title = 'Copied';
+                setTimeout(() => {
+                    btn.innerHTML = COPY_ICON;
+                    btn.classList.remove('copied');
+                    btn.title = 'Copy thinking process';
+                }, 1500);
+            } else {
+                btn.title = 'Copy failed';
+            }
+        });
+
+        // Prevent drag / selection interference
+        btn.addEventListener('mousedown', (e) => e.stopPropagation());
+
+        // Insert into toggleButton's parent so it sits to the right of the toggle icon
+        const parent = toggleButton.parentElement;
+        if (parent) {
+            const parentStyle = getComputedStyle(parent);
+            // Make parent flex if it isn't already, so the button vertically aligns
+            if (parentStyle.display !== 'flex' && parentStyle.display !== 'inline-flex') {
+                parent.style.display = 'flex';
+                parent.style.alignItems = 'center';
+            }
+            parent.appendChild(btn);
+        } else {
+            // Fallback: absolute-position at the top-right corner of the block
+            const bs = getComputedStyle(block);
+            if (bs.position === 'static') block.style.position = 'relative';
+            btn.style.position = 'absolute';
+            btn.style.top = '8px';
+            btn.style.right = '8px';
+            block.appendChild(btn);
+        }
+    }
+
+    // ==================== Smooth Collapse ====================
     function smoothCollapseBlock(block, toggleButton) {
         const duration = CONFIG.collapseDuration;
 
@@ -138,7 +301,7 @@
         });
     }
 
-    // ==================== 核心：追踪直到稳定 ====================
+    // ==================== Track Until Stable, Then Collapse ====================
     function trackUntilStable(block) {
         if (blockStates.has(block)) return;
         if (userExpandedBlocks.has(block)) return;
@@ -152,7 +315,7 @@
         };
         blockStates.set(block, state);
 
-        log('开始追踪思考块，初始长度:', state.lastLen);
+        log('Start tracking think block, initial length:', state.lastLen);
 
         state.timerId = setInterval(() => {
             if (state.done) return;
@@ -165,9 +328,12 @@
             if (userExpandedBlocks.has(block)) {
                 clearInterval(state.timerId);
                 state.timerId = null;
-                log('块被用户展开，停止追踪');
                 return;
             }
+
+            // Refresh cache and button on every poll
+            cacheThinkText(block);
+            injectCopyButton(block);
 
             const len = (block.textContent || '').length;
             if (len !== state.lastLen) {
@@ -188,19 +354,19 @@
             const toggleButton = block.querySelector('.' + SELECTORS.toggleButton);
             if (!toggleButton) return;
 
-            if (isInCooldown()) {
-                // 用户在操作，等一会儿再试
-                return;
-            }
+            if (isInCooldown()) return;
 
             state.done = true;
             clearInterval(state.timerId);
             state.timerId = null;
 
+            // Final cache before collapsing
+            cacheThinkText(block);
+
             const scrollContainer = getScrollContainer(block);
             const wasNearBottom = CONFIG.autoScrollToBottom ? isNearBottom(scrollContainer) : false;
 
-            log('思考结束，开始平滑折叠');
+            log('Thinking complete, starting smooth collapse');
 
             smoothCollapseBlock(block, toggleButton).then(() => {
                 if (wasNearBottom) {
@@ -218,13 +384,23 @@
         if (!CONFIG.enabled) return;
         const selector = `.${SELECTORS.thinkBlockContainer}:not(.${SELECTORS.collapsedStateClass})`;
         document.querySelectorAll(selector).forEach(block => {
+            injectCopyButton(block);
             trackUntilStable(block);
+        });
+
+        // Also inject buttons into already-collapsed blocks (e.g. history on reload)
+        const collapsedSelector = `.${SELECTORS.thinkBlockContainer}.${SELECTORS.collapsedStateClass}`;
+        document.querySelectorAll(collapsedSelector).forEach(block => {
+            injectCopyButton(block);
         });
     }
 
-    // ==================== 监听器 ====================
+    // ==================== Listeners ====================
     function setupUserInteractionListener() {
         document.addEventListener('click', (event) => {
+            // Clicking the copy button is not a user expand action
+            if (event.target.closest('.' + COPY_BTN_CLASS)) return;
+
             const toggleButton = event.target.closest(`.${SELECTORS.toggleButton}`);
             if (!toggleButton) return;
 
@@ -233,7 +409,6 @@
             const block = toggleButton.closest(`.${SELECTORS.thinkBlockContainer}`);
             if (!block) return;
 
-            // 判断点击前是否已展开
             const wasExpanded = Array.from(block.querySelectorAll('div, p, pre')).some(el => {
                 if (el === toggleButton) return false;
                 const h = el.getBoundingClientRect().height;
@@ -241,14 +416,13 @@
             });
 
             if (!wasExpanded) {
-                // 用户正在展开，加入保护名单，停止追踪
                 userExpandedBlocks.add(block);
                 const st = blockStates.get(block);
                 if (st && st.timerId) {
                     clearInterval(st.timerId);
                     st.timerId = null;
                 }
-                log('用户手动展开，加入保护名单');
+                log('User manually expanded, added to protected list');
             }
         }, true);
     }
@@ -271,7 +445,7 @@
     function onUrlChange() {
         const newUrl = location.href;
         if (newUrl === currentUrl) return;
-        log(`URL 变化: ${currentUrl} -> ${newUrl}`);
+        log(`URL changed: ${currentUrl} -> ${newUrl}`);
         currentUrl = newUrl;
         if (newUrl.includes('/a/chat/')) {
             setTimeout(scanAndTrack, CONFIG.navigationDelay);
@@ -293,7 +467,7 @@
     }
 
     function init() {
-        log('脚本已加载');
+        log('Script loaded');
         registerMenuCommands();
         if (!CONFIG.enabled) return;
         setupUserInteractionListener();
