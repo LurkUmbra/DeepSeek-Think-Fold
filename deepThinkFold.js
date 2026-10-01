@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         DeepSeek Think Auto-Collapse (Collapse After Thinking + Copy Button)
+// @name         DeepSeek Think Auto-Collapse (Collapse After Thinking + Copy Button + Scroll Lock)
 // @namespace    https://github.com/hza2002/deepseek-collapse-think
-// @version      2.1
-// @description  Smoothly collapse DeepSeek's Think block after reasoning completes, and add a copy button right next to the toggle icon.
+// @version      3.0
+// @description  Smoothly collapse DeepSeek's Think block after reasoning completes. Adds a copy button and locks scroll position through the entire streaming reply.
 // @license      MIT
 // @match        https://chat.deepseek.com/*
 // @icon         https://chat.deepseek.com/favicon.svg
@@ -26,7 +26,12 @@
         collapseDuration: 350,
         smoothCollapse: true,
         stableThreshold: 800,
-        pollInterval: 200
+        pollInterval: 200,
+        lockScrollDuringThinking: true,
+        scrollToAnswerAfterCollapse: true,
+        userScrollIntentWindow: 800,
+        // NEW: keep the lock engaged while the answer streams in
+        keepLockUntilAnswerStable: true
     };
 
     const CONFIG = {
@@ -44,7 +49,11 @@
         collapseDuration: DEFAULT_CONFIG.collapseDuration,
         smoothCollapse: DEFAULT_CONFIG.smoothCollapse,
         stableThreshold: DEFAULT_CONFIG.stableThreshold,
-        pollInterval: DEFAULT_CONFIG.pollInterval
+        pollInterval: DEFAULT_CONFIG.pollInterval,
+        lockScrollDuringThinking: DEFAULT_CONFIG.lockScrollDuringThinking,
+        scrollToAnswerAfterCollapse: DEFAULT_CONFIG.scrollToAnswerAfterCollapse,
+        userScrollIntentWindow: DEFAULT_CONFIG.userScrollIntentWindow,
+        keepLockUntilAnswerStable: DEFAULT_CONFIG.keepLockUntilAnswerStable
     };
 
     // ==================== Selectors ====================
@@ -150,6 +159,157 @@
         container.scrollTop = container.scrollHeight;
     }
 
+    // ==================== Scroll Lock ====================
+    const scrollLock = {
+        active: false,
+        container: null,
+        scrollTop: 0,
+        userIntentUntil: 0,
+        onScroll: null,
+        owner: null,
+        monitorTimer: null
+    };
+
+    function markUserScrollIntent() {
+        scrollLock.userIntentUntil = Date.now() + CONFIG.userScrollIntentWindow;
+    }
+
+    function setupUserScrollIntentListeners() {
+        ['wheel', 'touchstart', 'touchmove'].forEach(evt => {
+            document.addEventListener(evt, markUserScrollIntent, { passive: true, capture: true });
+        });
+        document.addEventListener('keydown', (e) => {
+            const keys = ['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End'];
+            if (keys.includes(e.key)) markUserScrollIntent();
+        }, { passive: true, capture: true });
+    }
+
+    function startScrollLock(container, owner) {
+        if (!CONFIG.lockScrollDuringThinking) return;
+        if (!container) return;
+
+        if (scrollLock.active) {
+            if (scrollLock.container === container) {
+                if (!scrollLock.owner) scrollLock.owner = owner;
+                return;
+            }
+            stopScrollLock();
+        }
+
+        scrollLock.active = true;
+        scrollLock.container = container;
+        scrollLock.scrollTop = container.scrollTop;
+        scrollLock.userIntentUntil = 0;
+        scrollLock.owner = owner || null;
+
+        scrollLock.onScroll = () => {
+            if (!scrollLock.active || scrollLock.container !== container) return;
+            const now = Date.now();
+            if (now < scrollLock.userIntentUntil) {
+                // User is intentionally scrolling: follow them
+                scrollLock.scrollTop = container.scrollTop;
+                return;
+            }
+            // Programmatic auto-scroll: snap back
+            if (Math.abs(container.scrollTop - scrollLock.scrollTop) > 1) {
+                container.scrollTop = scrollLock.scrollTop;
+            }
+        };
+        container.addEventListener('scroll', scrollLock.onScroll, { passive: true });
+        log('Scroll lock engaged at', scrollLock.scrollTop);
+    }
+
+    function stopScrollLock() {
+        if (scrollLock.monitorTimer) {
+            clearInterval(scrollLock.monitorTimer);
+            scrollLock.monitorTimer = null;
+        }
+        if (!scrollLock.active) return;
+        if (scrollLock.container && scrollLock.onScroll) {
+            scrollLock.container.removeEventListener('scroll', scrollLock.onScroll);
+        }
+        scrollLock.active = false;
+        scrollLock.container = null;
+        scrollLock.onScroll = null;
+        scrollLock.owner = null;
+        log('Scroll lock released');
+    }
+
+    /**
+     * Update the lock's target position (used after we reposition the viewport).
+     */
+    function updateLockTarget(container, newTop) {
+        if (!scrollLock.active) return;
+        if (scrollLock.container !== container) return;
+        scrollLock.scrollTop = newTop;
+    }
+
+    /**
+     * Position the collapsed block near the top of the viewport.
+     */
+    function scrollToAnswer(block, container) {
+        if (!CONFIG.scrollToAnswerAfterCollapse || !container) return;
+        try {
+            const containerRect = container.getBoundingClientRect();
+            const blockRect = block.getBoundingClientRect();
+            const offset = 16;
+            const target = container.scrollTop + (blockRect.top - containerRect.top) - offset;
+            const newTop = Math.max(0, target);
+            container.scrollTop = newTop;
+            updateLockTarget(container, newTop);
+        } catch (e) {
+            log('scrollToAnswer failed:', e);
+        }
+    }
+
+    /**
+     * Keep the lock engaged until the scroll container's scrollHeight
+     * stops changing for stableThreshold ms (i.e. the answer finished streaming).
+     */
+    function monitorAnswerStability(container) {
+        if (!CONFIG.keepLockUntilAnswerStable) {
+            // Fall back to immediate release
+            stopScrollLock();
+            return;
+        }
+        if (scrollLock.monitorTimer) {
+            clearInterval(scrollLock.monitorTimer);
+            scrollLock.monitorTimer = null;
+        }
+
+        let lastHeight = container.scrollHeight;
+        let lastChange = Date.now();
+
+        scrollLock.monitorTimer = setInterval(() => {
+            // If lock got released or replaced, stop monitoring
+            if (!scrollLock.active || scrollLock.container !== container) {
+                clearInterval(scrollLock.monitorTimer);
+                scrollLock.monitorTimer = null;
+                return;
+            }
+            if (!document.body.contains(container)) {
+                clearInterval(scrollLock.monitorTimer);
+                scrollLock.monitorTimer = null;
+                stopScrollLock();
+                return;
+            }
+
+            const h = container.scrollHeight;
+            if (h !== lastHeight) {
+                lastHeight = h;
+                lastChange = Date.now();
+                return;
+            }
+
+            if (Date.now() - lastChange >= CONFIG.stableThreshold) {
+                clearInterval(scrollLock.monitorTimer);
+                scrollLock.monitorTimer = null;
+                log('Answer streaming stable, releasing scroll lock');
+                stopScrollLock();
+            }
+        }, CONFIG.pollInterval);
+    }
+
     // ==================== Copy Button ====================
     function extractThinkText(block) {
         if (thinkTextCache.has(block)) {
@@ -198,16 +358,12 @@
     }
 
     function injectCopyButton(block) {
-        // Skip if already injected (either in the block or inside toggleButton)
         if (block.querySelector('.' + COPY_BTN_CLASS)) return;
-
         const toggleButton = block.querySelector('.' + SELECTORS.toggleButton);
         if (!toggleButton) return;
 
         ensureStyle();
 
-        // Use <span role="button"> instead of <button>,
-        // because toggleButton itself may be a <button> and nested <button> is invalid HTML.
         const btn = document.createElement('span');
         btn.className = COPY_BTN_CLASS;
         btn.setAttribute('role', 'button');
@@ -219,13 +375,8 @@
         const doCopy = async (e) => {
             e.stopPropagation();
             e.preventDefault();
-
             const text = extractThinkText(block);
-            if (!text) {
-                btn.title = 'Nothing to copy';
-                return;
-            }
-
+            if (!text) { btn.title = 'Nothing to copy'; return; }
             const ok = await copyToClipboard(text);
             if (ok) {
                 btn.innerHTML = CHECK_ICON;
@@ -242,32 +393,24 @@
         };
 
         btn.addEventListener('click', doCopy);
-        btn.addEventListener('keydown', (e) => {
-            if (e.key === 'Enter' || e.key === ' ') doCopy(e);
-        });
+        btn.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') doCopy(e); });
         btn.addEventListener('mousedown', (e) => e.stopPropagation());
 
-        // Make sure toggleButton can host the button inline, next to the arrow icon
         const tbStyle = getComputedStyle(toggleButton);
         if (tbStyle.display !== 'flex' && tbStyle.display !== 'inline-flex') {
             toggleButton.style.display = 'inline-flex';
             toggleButton.style.alignItems = 'center';
         }
-
-        // Append INSIDE toggleButton, at the very end.
-        // This puts the button right after the arrow icon / label, not far to the right.
         toggleButton.appendChild(btn);
     }
 
     // ==================== Smooth Collapse ====================
     function smoothCollapseBlock(block, toggleButton) {
         const duration = CONFIG.collapseDuration;
-
         if (!CONFIG.smoothCollapse || duration <= 0) {
             try { toggleButton.click(); } catch (e) {}
             return Promise.resolve();
         }
-
         return new Promise(resolve => {
             const startHeight = block.offsetHeight;
             let endHeight = toggleButton.offsetHeight || 40;
@@ -277,7 +420,6 @@
             block.style.height = startHeight + 'px';
             block.style.transition = `height ${duration}ms ease, opacity ${duration}ms ease`;
             block.style.willChange = 'height, opacity';
-
             void block.offsetHeight;
 
             requestAnimationFrame(() => {
@@ -313,21 +455,25 @@
 
         log('Start tracking think block, initial length:', state.lastLen);
 
+        const initialContainer = getScrollContainer(block);
+        startScrollLock(initialContainer, block);
+
         state.timerId = setInterval(() => {
             if (state.done) return;
 
             if (!document.body.contains(block)) {
                 clearInterval(state.timerId);
                 state.timerId = null;
+                if (scrollLock.owner === block) stopScrollLock();
                 return;
             }
             if (userExpandedBlocks.has(block)) {
                 clearInterval(state.timerId);
                 state.timerId = null;
+                if (scrollLock.owner === block) stopScrollLock();
                 return;
             }
 
-            // Refresh cache and button on every poll
             cacheThinkText(block);
             injectCopyButton(block);
 
@@ -335,6 +481,10 @@
             if (len !== state.lastLen) {
                 state.lastLen = len;
                 state.lastChangeTime = Date.now();
+                if (!scrollLock.active || scrollLock.owner !== block) {
+                    const c = getScrollContainer(block);
+                    startScrollLock(c, block);
+                }
                 return;
             }
 
@@ -344,12 +494,12 @@
                 state.done = true;
                 clearInterval(state.timerId);
                 state.timerId = null;
+                if (scrollLock.owner === block) stopScrollLock();
                 return;
             }
 
             const toggleButton = block.querySelector('.' + SELECTORS.toggleButton);
             if (!toggleButton) return;
-
             if (isInCooldown()) return;
 
             state.done = true;
@@ -359,18 +509,26 @@
             cacheThinkText(block);
 
             const scrollContainer = getScrollContainer(block);
-            const wasNearBottom = CONFIG.autoScrollToBottom ? isNearBottom(scrollContainer) : false;
 
             log('Thinking complete, starting smooth collapse');
 
             smoothCollapseBlock(block, toggleButton).then(() => {
-                if (wasNearBottom) {
-                    requestAnimationFrame(() => {
-                        scrollToBottom(scrollContainer);
-                        setTimeout(() => scrollToBottom(scrollContainer), 80);
-                        setTimeout(() => scrollToBottom(scrollContainer), 200);
-                    });
+                // Do NOT release the lock here. The answer is still streaming and
+                // DeepSeek will try to drag the viewport down. Keep the lock,
+                // re-anchor the viewport to the collapsed block, and wait for
+                // the stream to finish before letting go.
+                if (scrollLock.active && scrollLock.container === scrollContainer) {
+                    // Reassign ownership to the collapse flow
+                    scrollLock.owner = block;
+                } else {
+                    startScrollLock(scrollContainer, block);
                 }
+
+                // Reposition the viewport to the folded block.
+                scrollToAnswer(block, scrollContainer);
+
+                // Keep the lock until the container's scrollHeight settles.
+                monitorAnswerStability(scrollContainer);
             });
         }, CONFIG.pollInterval);
     }
@@ -415,6 +573,7 @@
                     clearInterval(st.timerId);
                     st.timerId = null;
                 }
+                if (scrollLock.owner === block) stopScrollLock();
                 log('User manually expanded, added to protected list');
             }
         }, true);
@@ -440,6 +599,7 @@
         if (newUrl === currentUrl) return;
         log(`URL changed: ${currentUrl} -> ${newUrl}`);
         currentUrl = newUrl;
+        stopScrollLock();
         if (newUrl.includes('/a/chat/')) {
             setTimeout(scanAndTrack, CONFIG.navigationDelay);
             setTimeout(scanAndTrack, CONFIG.navigationDelay * 2);
@@ -463,6 +623,7 @@
         log('Script loaded');
         registerMenuCommands();
         if (!CONFIG.enabled) return;
+        setupUserScrollIntentListeners();
         setupUserInteractionListener();
         setupUrlChangeListener();
         setupObserver();
