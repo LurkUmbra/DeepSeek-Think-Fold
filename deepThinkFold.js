@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         DeepSeek Think Auto-Collapse (Collapse After Thinking + Copy Button + Scroll Lock)
 // @namespace    https://github.com/hza2002/deepseek-collapse-think
-// @version      3.0
-// @description  Smoothly collapse DeepSeek's Think block after reasoning completes. Adds a copy button and locks scroll position through the entire streaming reply.
+// @version      3.1
+// @description  Smoothly collapse DeepSeek's Think block after reasoning completes. Adds a copy button and locks scroll position only for the message you just sent.
 // @license      MIT
 // @match        https://chat.deepseek.com/*
 // @icon         https://chat.deepseek.com/favicon.svg
@@ -30,8 +30,8 @@
         lockScrollDuringThinking: true,
         scrollToAnswerAfterCollapse: true,
         userScrollIntentWindow: 800,
-        // NEW: keep the lock engaged while the answer streams in
-        keepLockUntilAnswerStable: true
+        keepLockUntilAnswerStable: true,
+        releaseLockOnOutsideClick: true
     };
 
     const CONFIG = {
@@ -53,13 +53,14 @@
         lockScrollDuringThinking: DEFAULT_CONFIG.lockScrollDuringThinking,
         scrollToAnswerAfterCollapse: DEFAULT_CONFIG.scrollToAnswerAfterCollapse,
         userScrollIntentWindow: DEFAULT_CONFIG.userScrollIntentWindow,
-        keepLockUntilAnswerStable: DEFAULT_CONFIG.keepLockUntilAnswerStable
+        keepLockUntilAnswerStable: DEFAULT_CONFIG.keepLockUntilAnswerStable,
+        releaseLockOnOutsideClick: DEFAULT_CONFIG.releaseLockOnOutsideClick
     };
 
     // ==================== Selectors ====================
     const SELECTORS = {
         thinkBlockContainer: '_74c0879',
-        collapsedStateClass: 'e47135bc',
+        collapsedStateClass: '_e47135bc',
         toggleButton: '_5ab5d64',
         thinkContent: 'ds-think-content'
     };
@@ -184,6 +185,20 @@
         }, { passive: true, capture: true });
     }
 
+    function setupOutsideClickRelease() {
+        document.addEventListener('click', (event) => {
+            if (!CONFIG.releaseLockOnOutsideClick) return;
+            if (!scrollLock.active || !scrollLock.container) return;
+
+            if (event.target.closest('.' + COPY_BTN_CLASS)) return;
+            if (event.target.closest(`.${SELECTORS.toggleButton}`)) return;
+            if (scrollLock.container.contains(event.target)) return;
+
+            log('Click outside locked container, releasing scroll lock');
+            stopScrollLock();
+        }, true);
+    }
+
     function startScrollLock(container, owner) {
         if (!CONFIG.lockScrollDuringThinking) return;
         if (!container) return;
@@ -206,11 +221,9 @@
             if (!scrollLock.active || scrollLock.container !== container) return;
             const now = Date.now();
             if (now < scrollLock.userIntentUntil) {
-                // User is intentionally scrolling: follow them
                 scrollLock.scrollTop = container.scrollTop;
                 return;
             }
-            // Programmatic auto-scroll: snap back
             if (Math.abs(container.scrollTop - scrollLock.scrollTop) > 1) {
                 container.scrollTop = scrollLock.scrollTop;
             }
@@ -235,18 +248,12 @@
         log('Scroll lock released');
     }
 
-    /**
-     * Update the lock's target position (used after we reposition the viewport).
-     */
     function updateLockTarget(container, newTop) {
         if (!scrollLock.active) return;
         if (scrollLock.container !== container) return;
         scrollLock.scrollTop = newTop;
     }
 
-    /**
-     * Position the collapsed block near the top of the viewport.
-     */
     function scrollToAnswer(block, container) {
         if (!CONFIG.scrollToAnswerAfterCollapse || !container) return;
         try {
@@ -262,13 +269,8 @@
         }
     }
 
-    /**
-     * Keep the lock engaged until the scroll container's scrollHeight
-     * stops changing for stableThreshold ms (i.e. the answer finished streaming).
-     */
     function monitorAnswerStability(container) {
         if (!CONFIG.keepLockUntilAnswerStable) {
-            // Fall back to immediate release
             stopScrollLock();
             return;
         }
@@ -281,7 +283,6 @@
         let lastChange = Date.now();
 
         scrollLock.monitorTimer = setInterval(() => {
-            // If lock got released or replaced, stop monitoring
             if (!scrollLock.active || scrollLock.container !== container) {
                 clearInterval(scrollLock.monitorTimer);
                 scrollLock.monitorTimer = null;
@@ -449,14 +450,18 @@
             lastLen: (block.textContent || '').length,
             lastChangeTime: Date.now(),
             timerId: null,
-            done: false
+            done: false,
+            // KEY: only true if we ever saw the content grow.
+            // Historical replays have fixed content, so this stays false
+            // and no scroll lock / scroll-to-answer is triggered.
+            sawGrowth: false
         };
         blockStates.set(block, state);
 
         log('Start tracking think block, initial length:', state.lastLen);
 
-        const initialContainer = getScrollContainer(block);
-        startScrollLock(initialContainer, block);
+        // NOTE: intentionally NOT starting the scroll lock here.
+        // We only lock once we observe the content growing.
 
         state.timerId = setInterval(() => {
             if (state.done) return;
@@ -481,6 +486,13 @@
             if (len !== state.lastLen) {
                 state.lastLen = len;
                 state.lastChangeTime = Date.now();
+
+                // Content is growing => this is the live generation.
+                // Engage the scroll lock now (and only now).
+                if (!state.sawGrowth) {
+                    state.sawGrowth = true;
+                    log('Content growth detected, engaging scroll lock');
+                }
                 if (!scrollLock.active || scrollLock.owner !== block) {
                     const c = getScrollContainer(block);
                     startScrollLock(c, block);
@@ -509,26 +521,24 @@
             cacheThinkText(block);
 
             const scrollContainer = getScrollContainer(block);
+            const shouldScroll = state.sawGrowth && CONFIG.scrollToAnswerAfterCollapse;
 
-            log('Thinking complete, starting smooth collapse');
+            log('Thinking complete, starting smooth collapse. willScroll=' + shouldScroll);
 
             smoothCollapseBlock(block, toggleButton).then(() => {
-                // Do NOT release the lock here. The answer is still streaming and
-                // DeepSeek will try to drag the viewport down. Keep the lock,
-                // re-anchor the viewport to the collapsed block, and wait for
-                // the stream to finish before letting go.
-                if (scrollLock.active && scrollLock.container === scrollContainer) {
-                    // Reassign ownership to the collapse flow
-                    scrollLock.owner = block;
+                if (shouldScroll) {
+                    // Live generation: keep the lock and re-anchor to the folded block.
+                    if (scrollLock.active && scrollLock.container === scrollContainer) {
+                        scrollLock.owner = block;
+                    } else {
+                        startScrollLock(scrollContainer, block);
+                    }
+                    scrollToAnswer(block, scrollContainer);
+                    monitorAnswerStability(scrollContainer);
                 } else {
-                    startScrollLock(scrollContainer, block);
+                    // Historical replay: fold quietly, no scrolling, no locking.
+                    if (scrollLock.owner === block) stopScrollLock();
                 }
-
-                // Reposition the viewport to the folded block.
-                scrollToAnswer(block, scrollContainer);
-
-                // Keep the lock until the container's scrollHeight settles.
-                monitorAnswerStability(scrollContainer);
             });
         }, CONFIG.pollInterval);
     }
@@ -624,6 +634,7 @@
         registerMenuCommands();
         if (!CONFIG.enabled) return;
         setupUserScrollIntentListeners();
+        setupOutsideClickRelease();
         setupUserInteractionListener();
         setupUrlChangeListener();
         setupObserver();
