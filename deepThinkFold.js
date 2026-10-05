@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         DeepSeek Think Auto-Collapse (Collapse After Thinking + Copy Button + Scroll Lock)
 // @namespace    https://github.com/hza2002/deepseek-collapse-think
-// @version      3.1
-// @description  Smoothly collapse DeepSeek's Think block after reasoning completes. Adds a copy button and locks scroll position only for the message you just sent.
+// @version      3.2
+// @description  Smoothly collapse DeepSeek's Think block after reasoning completes. Adds a copy button and locks scroll position. Fixes jitter by force-cancelling ongoing smooth-scroll animations.
 // @license      MIT
 // @match        https://chat.deepseek.com/*
 // @icon         https://chat.deepseek.com/favicon.svg
@@ -31,7 +31,12 @@
         scrollToAnswerAfterCollapse: true,
         userScrollIntentWindow: 800,
         keepLockUntilAnswerStable: true,
-        releaseLockOnOutsideClick: true
+        releaseLockOnOutsideClick: true,
+        historicalStartDelay: 1500,
+        historicalGap: 40,
+        historicalAbandonMs: 1200,
+        // Number of frames to keep scrollTop pinned after a fold, cancelling smooth animations.
+        pinFrames: 20
     };
 
     const CONFIG = {
@@ -54,13 +59,17 @@
         scrollToAnswerAfterCollapse: DEFAULT_CONFIG.scrollToAnswerAfterCollapse,
         userScrollIntentWindow: DEFAULT_CONFIG.userScrollIntentWindow,
         keepLockUntilAnswerStable: DEFAULT_CONFIG.keepLockUntilAnswerStable,
-        releaseLockOnOutsideClick: DEFAULT_CONFIG.releaseLockOnOutsideClick
+        releaseLockOnOutsideClick: DEFAULT_CONFIG.releaseLockOnOutsideClick,
+        historicalStartDelay: DEFAULT_CONFIG.historicalStartDelay,
+        historicalGap: DEFAULT_CONFIG.historicalGap,
+        historicalAbandonMs: DEFAULT_CONFIG.historicalAbandonMs,
+        pinFrames: DEFAULT_CONFIG.pinFrames
     };
 
     // ==================== Selectors ====================
     const SELECTORS = {
         thinkBlockContainer: '_74c0879',
-        collapsedStateClass: '_e47135bc',
+        collapsedStateClass: 'e47135bc',
         toggleButton: '_5ab5d64',
         thinkContent: 'ds-think-content'
     };
@@ -73,6 +82,9 @@
     // ==================== State ====================
     let currentUrl = location.href;
     let lastUserInteraction = 0;
+    // Timestamp of the last sidebar/navigation-related click. Used to suppress
+    // spurious "user expanded" detection during page transitions.
+    let lastNavigationClick = 0;
     const blockStates = new WeakMap();
     const userExpandedBlocks = new WeakSet();
     const thinkTextCache = new WeakMap();
@@ -160,6 +172,55 @@
         container.scrollTop = container.scrollHeight;
     }
 
+    // ==================== Pin ScrollTop ====================
+    // Force the scroll container's scrollTop to a fixed value over multiple
+    // frames, cancelling any in-progress smooth-scroll animation from DeepSeek.
+    function pinScrollTop(container, targetTop, frames) {
+        return new Promise(resolve => {
+            let left = frames;
+            let lastTarget = targetTop;
+
+            const step = () => {
+                if (left <= 0) {
+                    resolve(lastTarget);
+                    return;
+                }
+                if (Math.abs(container.scrollTop - lastTarget) > 0.5) {
+                    container.scrollTop = lastTarget;
+                }
+                left--;
+                requestAnimationFrame(step);
+            };
+
+            // Allow the caller to update the target mid-flight via this handle
+            const handle = {
+                setTarget: (t) => { lastTarget = t; },
+                stop: () => { left = 0; }
+            };
+            step();
+            // Expose handle via closure by attaching to the promise for convenience
+            pinScrollTop._handle = handle;
+            resolve(); // Early resolve, caller keeps frame count via setTarget
+        });
+    }
+
+    // More flexible: caller controls target over frames
+    function pinScrollTopFrames(container, getTarget, frames) {
+        return new Promise(resolve => {
+            let left = frames;
+            const step = () => {
+                if (left <= 0) { resolve(); return; }
+                const target = getTarget();
+                if (Math.abs(container.scrollTop - target) > 0.5) {
+                    container.scrollTop = target;
+                }
+                left--;
+                requestAnimationFrame(step);
+            };
+            step();
+        });
+    }
+
     // ==================== Scroll Lock ====================
     const scrollLock = {
         active: false,
@@ -168,7 +229,8 @@
         userIntentUntil: 0,
         onScroll: null,
         owner: null,
-        monitorTimer: null
+        monitorTimer: null,
+        pinTimer: null
     };
 
     function markUserScrollIntent() {
@@ -183,6 +245,40 @@
             const keys = ['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End'];
             if (keys.includes(e.key)) markUserScrollIntent();
         }, { passive: true, capture: true });
+    }
+
+    // ==================== Scroll Guards ====================
+    const originalScrollIntoView = Element.prototype.scrollIntoView;
+    const originalElementScrollTo = Element.prototype.scrollTo;
+    const originalWindowScrollTo = window.scrollTo;
+    let allowProgrammaticScroll = false;
+
+    function installScrollGuards() {
+        Element.prototype.scrollIntoView = function(...args) {
+            if (scrollLock.active && !allowProgrammaticScroll) {
+                log('Blocked scrollIntoView during lock');
+                return;
+            }
+            return originalScrollIntoView.apply(this, args);
+        };
+
+        Element.prototype.scrollTo = function(...args) {
+            if (scrollLock.active && !allowProgrammaticScroll) {
+                log('Blocked element.scrollTo during lock');
+                return;
+            }
+            return originalElementScrollTo.apply(this, args);
+        };
+
+        window.scrollTo = function(...args) {
+            if (scrollLock.active && !allowProgrammaticScroll) {
+                log('Blocked window.scrollTo during lock');
+                return;
+            }
+            return originalWindowScrollTo.apply(this, args);
+        };
+
+        log('Scroll guards installed');
     }
 
     function setupOutsideClickRelease() {
@@ -229,6 +325,14 @@
             }
         };
         container.addEventListener('scroll', scrollLock.onScroll, { passive: true });
+
+        // Force-cancel any smooth-scroll animation that was already in progress.
+        // This is the key fix for jitter: DeepSeek may have called
+        // element.scrollTo({behavior:'smooth'}) BEFORE our guard kicked in,
+        // and that animation runs for ~300-500ms. Pinning scrollTop for the
+        // first several frames overrides the animation frame-by-frame.
+        pinScrollTopFrames(container, () => scrollLock.scrollTop, CONFIG.pinFrames);
+
         log('Scroll lock engaged at', scrollLock.scrollTop);
     }
 
@@ -264,6 +368,8 @@
             const newTop = Math.max(0, target);
             container.scrollTop = newTop;
             updateLockTarget(container, newTop);
+            // Pin for a few frames to cancel any pending smooth animation
+            pinScrollTopFrames(container, () => newTop, 6);
         } catch (e) {
             log('scrollToAnswer failed:', e);
         }
@@ -405,7 +511,7 @@
         toggleButton.appendChild(btn);
     }
 
-    // ==================== Smooth Collapse ====================
+    // ==================== Smooth Collapse (Live) ====================
     function smoothCollapseBlock(block, toggleButton) {
         const duration = CONFIG.collapseDuration;
         if (!CONFIG.smoothCollapse || duration <= 0) {
@@ -440,28 +546,97 @@
         });
     }
 
+    // ==================== Historical Quiet Collapse ====================
+    // Fold a historical block while pinning scrollTop frame-by-frame to a
+    // target value. This neutralizes any smooth-scroll animation that
+    // DeepSeek may have started before our guard was in place.
+    async function quietCollapseBlock(block, container) {
+        if (!document.body.contains(block)) return;
+        if (block.classList.contains(SELECTORS.collapsedStateClass)) return;
+
+        const toggleButton = block.querySelector('.' + SELECTORS.toggleButton);
+        if (!toggleButton) return;
+
+        const H1 = block.offsetHeight;
+        const buttonH = toggleButton.offsetHeight || 40;
+        const estimatedD = Math.max(0, H1 - buttonH);
+
+        const containerRect = container.getBoundingClientRect();
+        const blockRect = block.getBoundingClientRect();
+        const aboveViewport = Math.max(0, containerRect.top - blockRect.top);
+        const beforeTop = container.scrollTop;
+
+        // Initial target based on estimated shrink
+        let targetTop = beforeTop - Math.min(estimatedD, aboveViewport);
+
+        // Click fold. React commit happens asynchronously.
+        try { toggleButton.click(); } catch (e) {}
+
+        // Pin scrollTop for several frames, updating the target each frame
+        // as the real height becomes known.
+        await pinScrollTopFrames(container, () => {
+            const H2 = block.offsetHeight;
+            const realD = Math.max(0, H1 - H2);
+            const realComp = Math.min(realD, aboveViewport);
+            targetTop = beforeTop - realComp;
+            return targetTop;
+        }, CONFIG.pinFrames);
+    }
+
+    // ==================== Historical Fold Queue ====================
+    const histQueue = [];
+    let histRunning = false;
+    let histEpoch = 0;
+
+    function enqueueHistorical(block) {
+        histQueue.push(block);
+        if (!histRunning) runHistoricalQueue();
+    }
+
+    async function runHistoricalQueue() {
+        histRunning = true;
+        const myEpoch = histEpoch;
+        while (histQueue.length > 0) {
+            if (myEpoch !== histEpoch) break;
+            const block = histQueue.shift();
+            if (!document.body.contains(block)) continue;
+            if (block.classList.contains(SELECTORS.collapsedStateClass)) continue;
+            if (userExpandedBlocks.has(block)) continue;
+
+            const container = getScrollContainer(block);
+            if (!container) continue;
+
+            await quietCollapseBlock(block, container);
+            await new Promise(r => setTimeout(r, CONFIG.historicalGap));
+        }
+        histRunning = false;
+    }
+
+    function resetHistoricalQueue() {
+        histEpoch++;
+        histQueue.length = 0;
+        histRunning = false;
+    }
+
     // ==================== Track Until Stable, Then Collapse ====================
     function trackUntilStable(block) {
         if (blockStates.has(block)) return;
         if (userExpandedBlocks.has(block)) return;
         if (block.classList.contains(SELECTORS.collapsedStateClass)) return;
 
+        const now = Date.now();
         const state = {
             lastLen: (block.textContent || '').length,
-            lastChangeTime: Date.now(),
+            lastChangeTime: now,
+            startTime: now,
             timerId: null,
             done: false,
-            // KEY: only true if we ever saw the content grow.
-            // Historical replays have fixed content, so this stays false
-            // and no scroll lock / scroll-to-answer is triggered.
-            sawGrowth: false
+            sawGrowth: false,
+            abandoned: false
         };
         blockStates.set(block, state);
 
         log('Start tracking think block, initial length:', state.lastLen);
-
-        // NOTE: intentionally NOT starting the scroll lock here.
-        // We only lock once we observe the content growing.
 
         state.timerId = setInterval(() => {
             if (state.done) return;
@@ -487,8 +662,6 @@
                 state.lastLen = len;
                 state.lastChangeTime = Date.now();
 
-                // Content is growing => this is the live generation.
-                // Engage the scroll lock now (and only now).
                 if (!state.sawGrowth) {
                     state.sawGrowth = true;
                     log('Content growth detected, engaging scroll lock');
@@ -496,6 +669,18 @@
                 if (!scrollLock.active || scrollLock.owner !== block) {
                     const c = getScrollContainer(block);
                     startScrollLock(c, block);
+                }
+                return;
+            }
+
+            if (!state.sawGrowth) {
+                if (Date.now() - state.startTime >= CONFIG.historicalAbandonMs) {
+                    state.done = true;
+                    state.abandoned = true;
+                    clearInterval(state.timerId);
+                    state.timerId = null;
+                    log('Historical block detected, scheduling quiet collapse');
+                    enqueueHistorical(block);
                 }
                 return;
             }
@@ -521,30 +706,23 @@
             cacheThinkText(block);
 
             const scrollContainer = getScrollContainer(block);
-            const shouldScroll = state.sawGrowth && CONFIG.scrollToAnswerAfterCollapse;
-
-            log('Thinking complete, starting smooth collapse. willScroll=' + shouldScroll);
+            log('Thinking complete (live), starting smooth collapse');
 
             smoothCollapseBlock(block, toggleButton).then(() => {
-                if (shouldScroll) {
-                    // Live generation: keep the lock and re-anchor to the folded block.
-                    if (scrollLock.active && scrollLock.container === scrollContainer) {
-                        scrollLock.owner = block;
-                    } else {
-                        startScrollLock(scrollContainer, block);
-                    }
-                    scrollToAnswer(block, scrollContainer);
-                    monitorAnswerStability(scrollContainer);
+                if (scrollLock.active && scrollLock.container === scrollContainer) {
+                    scrollLock.owner = block;
                 } else {
-                    // Historical replay: fold quietly, no scrolling, no locking.
-                    if (scrollLock.owner === block) stopScrollLock();
+                    startScrollLock(scrollContainer, block);
                 }
+                scrollToAnswer(block, scrollContainer);
+                monitorAnswerStability(scrollContainer);
             });
         }, CONFIG.pollInterval);
     }
 
     function scanAndTrack() {
         if (!CONFIG.enabled) return;
+
         const selector = `.${SELECTORS.thinkBlockContainer}:not(.${SELECTORS.collapsedStateClass})`;
         document.querySelectorAll(selector).forEach(block => {
             injectCopyButton(block);
@@ -559,6 +737,17 @@
 
     // ==================== Listeners ====================
     function setupUserInteractionListener() {
+        // Detect clicks on sidebar/conversation list BEFORE they bubble up,
+        // so we can suppress the "user expanded" mis-detection during navigation.
+        document.addEventListener('click', (event) => {
+            // Heuristic: a click that is NOT inside the message list area and
+            // has some anchor-like or list-item ancestor is likely navigation.
+            const navEl = event.target.closest('a[href*="/a/chat/"], [role="listitem"], [data-testid*="chat"]');
+            if (navEl) {
+                lastNavigationClick = Date.now();
+            }
+        }, true);
+
         document.addEventListener('click', (event) => {
             if (event.target.closest('.' + COPY_BTN_CLASS)) return;
 
@@ -569,6 +758,14 @@
 
             const block = toggleButton.closest(`.${SELECTORS.thinkBlockContainer}`);
             if (!block) return;
+
+            // Suppress mis-detection right after a navigation click.
+            // React may reorder DOM, and the toggleButton we detect could be a
+            // leftover element in a block that just got re-rendered.
+            if (Date.now() - lastNavigationClick < 500) {
+                log('Ignoring toggle click right after navigation');
+                return;
+            }
 
             const wasExpanded = Array.from(block.querySelectorAll('div, p, pre')).some(el => {
                 if (el === toggleButton) return false;
@@ -610,9 +807,12 @@
         log(`URL changed: ${currentUrl} -> ${newUrl}`);
         currentUrl = newUrl;
         stopScrollLock();
+        resetHistoricalQueue();
         if (newUrl.includes('/a/chat/')) {
             setTimeout(scanAndTrack, CONFIG.navigationDelay);
             setTimeout(scanAndTrack, CONFIG.navigationDelay * 2);
+            setTimeout(scanAndTrack, CONFIG.historicalStartDelay);
+            setTimeout(scanAndTrack, CONFIG.historicalStartDelay + 800);
         }
     }
 
@@ -633,6 +833,7 @@
         log('Script loaded');
         registerMenuCommands();
         if (!CONFIG.enabled) return;
+        installScrollGuards();
         setupUserScrollIntentListeners();
         setupOutsideClickRelease();
         setupUserInteractionListener();
